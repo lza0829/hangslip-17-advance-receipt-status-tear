@@ -6,8 +6,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import PROJECT_NAME
 from app.routers import dashboard, gates, quarantine, rules, settings, stores, tickets
 from app.seed import seed_if_empty
+from app.services.closure import reconcile_event_closure
 
 seed_if_empty()
+# 假推进收口：清掉历史「表面宣称」，现行态向事件闭包对齐，水位按真账重算。
+reconcile_event_closure()
 
 app = FastAPI(title=PROJECT_NAME)
 app.add_middleware(

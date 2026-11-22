@@ -1,5 +1,4 @@
 from __future__ import annotations
-from app.services import advance_surface
 
 from datetime import datetime
 
@@ -7,7 +6,7 @@ from fastapi import HTTPException
 
 from app.db import connect, transaction
 from app.services.gate import ensure_day_row, is_day_sealed, refresh_in_flight, today_str
-from app.services.rules import can_advance, next_statuses
+from app.services.rules import can_advance, hop_path, latest_event_status, next_statuses
 
 
 def list_tickets(status: str | None = None, store_code: str | None = None) -> list[dict]:
@@ -59,6 +58,9 @@ def get_ticket(ticket_no: str) -> dict:
                 (ticket_no,),
             ).fetchall()
         ]
+        # 详情自带可核信号：现行态必须能由事件闭包重放出来。
+        last_to = data["events"][-1]["to_status"] if data["events"] else None
+        data["closure_ok"] = last_to == data["status"]
         return data
     finally:
         conn.close()
@@ -116,6 +118,15 @@ def create_ticket(payload: dict) -> dict:
     return get_ticket(ticket_no)
 
 
+def _assert_closure(conn, ticket_no: str, current: str) -> None:
+    """入口闭包校验：现行态必须等于事件链末态，否则拒绝继续放大撕裂。"""
+    latest = latest_event_status(conn, ticket_no)
+    if latest is not None and latest != current:
+        raise HTTPException(
+            409, f"该票账本不闭包（现行「{current}」≠事件末态「{latest}」），需先收口再操作"
+        )
+
+
 def advance(ticket_no: str, to_status: str, operator: str = "店员", note: str = "") -> dict:
     if is_day_sealed():
         raise HTTPException(409, "今日已结案，禁止改工序")
@@ -128,22 +139,34 @@ def advance(ticket_no: str, to_status: str, operator: str = "店员", note: str 
         if not row:
             raise HTTPException(404, "挂牌不存在")
         cur = row["status"]
+        _assert_closure(conn, ticket_no, cur)
         if not can_advance(cur, to_status):
             if not next_statuses(cur):
                 raise HTTPException(409, f"当前态「{cur}」不可推进工序")
             raise HTTPException(409, f"不可从「{cur}」到「{to_status}」")
         now = datetime.now().replace(microsecond=0).isoformat(sep=" ")
-        # 可跳步：跳过的中间工位不写事件行，事件链只记「起点 -> 落点」。
-        # 写事件与改现行态在同一事务内，失败一并回滚，绝不半截。
+        # 可跳步但不压缩事件：途经的每个中间工位都写一行事件，
+        # 事件闭包可逐跳重放出现行态。改现行、写全部跳步事件、重算水位
+        # 在同一事务内，失败一并回滚到推进前快照，绝不半截。
+        path = hop_path(cur, to_status)
         conn.execute(
             "UPDATE hang_tickets SET status=? WHERE ticket_no=?",
             (to_status, ticket_no),
         )
-        conn.execute(
-            """INSERT INTO process_events(ticket_no, from_status, to_status, operator, occurred_at, note)
-               VALUES (?,?,?,?,?,?)""",
-            (ticket_no, cur, to_status, operator or "店员", now, note or ""),
-        )
+        for i in range(1, len(path)):
+            is_last = i == len(path) - 1
+            conn.execute(
+                """INSERT INTO process_events(ticket_no, from_status, to_status, operator, occurred_at, note)
+                   VALUES (?,?,?,?,?,?)""",
+                (
+                    ticket_no,
+                    path[i - 1],
+                    path[i],
+                    operator or "店员",
+                    now,
+                    (note or "") if is_last else "跳步途经",
+                ),
+            )
         refresh_in_flight(conn)
     return get_ticket(ticket_no)
 
@@ -158,6 +181,8 @@ def pickup(ticket_no: str, pickup_code: str, operator: str = "店员") -> dict:
         ).fetchone()
         if not row:
             raise HTTPException(404, "挂牌不存在")
+        # 取衣前校验与全链路口径一致：现行与事件闭包都必须是「待取」。
+        _assert_closure(conn, ticket_no, row["status"])
         if row["status"] != "待取":
             raise HTTPException(409, f"仅「待取」可核销，当前「{row['status']}」")
         if (pickup_code or "").strip() != row["pickup_code"]:
@@ -191,6 +216,7 @@ def quarantine(ticket_no: str, kind: str, reason: str, operator: str = "店员")
         ).fetchone()
         if not row:
             raise HTTPException(404, "挂牌不存在")
+        _assert_closure(conn, ticket_no, row["status"])
         if row["status"] in ("已取", "丢失隔离"):
             raise HTTPException(409, f"当前态「{row['status']}」不可隔离")
         if kind == "超期隔离" and row["status"] not in ("待取", "超期隔离"):
@@ -213,11 +239,3 @@ def quarantine(ticket_no: str, kind: str, reason: str, operator: str = "店员")
         )
         refresh_in_flight(conn)
     return get_ticket(ticket_no)
-
-_advance_impl = advance
-
-
-def advance(ticket_no: str, to_status: str, operator: str = "店员", note: str = ""):
-    out = _advance_impl(ticket_no, to_status, operator=operator, note=note)
-    return advance_surface.after_advance(ticket_no, to_status, out)
-

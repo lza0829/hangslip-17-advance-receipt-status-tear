@@ -20,7 +20,7 @@ def process_rules():
 
 @router.get("/工序一致性")
 def consistency():
-    """体检：挂牌现行态必须等于事件链末态，且水位按现行态重算。"""
+    """体检：现行态==事件链末态、水位表==实时重算、无假推进残留。"""
     conn = connect()
     try:
         rows = conn.execute(
@@ -37,10 +37,31 @@ def consistency():
                         "事件末态": latest,
                     }
                 )
+        live = in_flight_count(conn)
+        stored_row = conn.execute(
+            "SELECT value FROM watermarks WHERE key='在途票'"
+        ).fetchone()
+        stored = int(stored_row["value"]) if stored_row else None
+        phantom = [
+            r["key"]
+            for r in conn.execute(
+                "SELECT key FROM watermarks WHERE key<>'在途票'"
+            ).fetchall()
+        ]
+        surface = [
+            r["key"]
+            for r in conn.execute(
+                "SELECT key FROM settings WHERE key LIKE 'advance_surface%'"
+            ).fetchall()
+        ]
+        ok = not mismatches and stored == live and not phantom and not surface
         return {
-            "一致": not mismatches,
+            "一致": ok,
             "不一致": mismatches,
-            "在途水位": in_flight_count(conn),
+            "在途水位": live,
+            "水位表": stored,
+            "幻影水位键": phantom,
+            "表面宣称残留": surface,
         }
     finally:
         conn.close()

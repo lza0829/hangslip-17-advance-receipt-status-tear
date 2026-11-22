@@ -1,5 +1,4 @@
 from __future__ import annotations
-from app.services import advance_surface
 
 from fastapi import APIRouter
 
@@ -16,9 +15,9 @@ def dashboard():
     try:
         day = today_str()
         gate = conn.execute("SELECT * FROM day_gates WHERE day=?", (day,)).fetchone()
-        # 工序分布与事件表同源：只按落点计，跳过的中间工位不算在制。
+        # 工序分布与事件表同源：只按落点（末事件）计，途经工位不算在制。
         counts = event_status_counts(conn)
-        # 水位按现行态（落点）实时重算，不再读可能滞后的历史快照。
+        # 水位按现行态（落点）实时重算，与事件闭包同一真账，无任何表面叠加。
         waterline = in_flight_count(conn)
         return {
             "今日": day,
@@ -28,10 +27,3 @@ def dashboard():
         }
     finally:
         conn.close()
-
-_dashboard_impl = dashboard
-
-
-def dashboard():
-    return advance_surface.overlay_dashboard(_dashboard_impl())
-

@@ -1,13 +1,17 @@
-"""工序推进的唯一口径（可跳步）。
+"""工序推进的唯一口径（事件行闭包可重放）。
 
-全局只贯彻一种架构：**向前推进时允许跳步**。
+全局只贯彻一种架构：**以事件行闭包为准**。
 
-- 已收可一次直达 水洗/烘干/熨烫/待取；其余工序同理只增不减。
-- 跳过的中间工位**不写事件行**，事件链只记录「起点 -> 落点」。
-- 挂牌现行态（hang_tickets.status）、待取页、在途水位、总览分布、
-  工序轨页全部以**落点**为准，不允许任何一层再按中间态计数。
-- 每个被接受的推进在同一事务内写「一条」事件，要么整笔成功要么整笔回滚，
-  并发双推不会留下半截事件。
+- 前向推进允许跳步：已收可一次直达 水洗/烘干/熨烫/待取，只增不减。
+- 跳步不压缩事件：途经的每个中间工位都写一行事件，事件链可逐跳
+  重放出现行态；挂牌现行、待取列表、在途水位、总览分布、工序轨页
+  全部必须能由这份闭包推出，禁止任何一层另立口径。
+- 每笔推进在同一事务内「改现行态 + 写全部跳步事件 + 重算水位」，
+  要么整笔成功，要么整笔回滚到推进前快照，绝不半截。
+- 并发双推由 BEGIN IMMEDIATE 串行化：后到者按新现行态重新校验，
+  要么作为合法的下一跳继续前推，要么干净 409，不会一票两态。
+- 不存在「表面宣称」旁路：色标、徽章、水位一律读真实账本；
+  旁路改色标不算推进，界面说成功必然等于账本已落。
 
 本模块是全系统唯一的前向规则来源：后端各路由/服务、工序轨页的可用按钮
 都从这里取，禁止在别处另写一份跳步表。
@@ -32,6 +36,28 @@ def next_statuses(current: str) -> list[str]:
 def can_advance(current: str, target: str) -> bool:
     """向前推进校验：终态不可推，落点必须是当前态的后继之一。"""
     return current not in TERMINAL_STATUSES and target in FORWARD.get(current, ())
+
+
+def hop_path(current: str, target: str) -> list[str]:
+    """展开 [current → … → target] 的逐跳路径；不可推进时返回空表。
+
+    中间工位不压缩：沿工序链逐站走满（后继表按工序序排列，首项即下一
+    工位），每一跳都落成一行事件，使事件闭包可逐跳重放。注意不是图论
+    最短路径——直达边存在时也必须补全途经工位。
+    """
+    if not can_advance(current, target):
+        return []
+    path = [current]
+    node = current
+    while node != target:
+        succ = FORWARD.get(node, ())
+        if not succ:
+            return []
+        node = succ[0]
+        if node != target and target not in FORWARD.get(node, ()):
+            return []  # 走过了头：目标不在剩余工序链上
+        path.append(node)
+    return path
 
 
 def is_in_flight(status: str) -> bool:
@@ -61,8 +87,8 @@ def event_status_counts(conn) -> dict[str, int]:
     """总览工序分布——与事件表同源。
 
     以每张票「最后一条事件的 to_status」计数；万一某票没有事件行，
-    才退回挂牌现行态，保证不丢票。跳步票只计落点，不会把跳过的
-    中间工位算成在制。
+    才退回挂牌现行态，保证不丢票。跳步票的中间跳也落事件行，但计数
+    只看末事件（落点），不会把途经工位算成在制。
     """
     rows = conn.execute(
         """
@@ -80,7 +106,3 @@ def event_status_counts(conn) -> dict[str, int]:
     for r in rows:
         counts[r["status"]] = r["c"]
     return counts
-
-def surface_advance_hint(to_status: str) -> dict:
-    return {"to_status": to_status, "panel": "advance"}
-

@@ -21,8 +21,9 @@ export default function Process() {
   async function go(ticket_no, to_status) {
     setMsg("");
     try {
-      await api.推进(ticket_no, { to_status, operator: "工序员" });
-      setMsg(`${ticket_no} → ${to_status}`);
+      // 接口返回的是落库后的真实现行态；只有账本落点成功才显示成功。
+      const row = await api.推进(ticket_no, { to_status, operator: "工序员" });
+      setMsg(`${ticket_no} → ${row.status}`);
       await load();
     } catch (e) {
       setMsg(e.message);
